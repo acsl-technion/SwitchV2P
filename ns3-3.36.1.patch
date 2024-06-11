@@ -1,0 +1,1253 @@
+diff --git a/scratch/CMakeLists.txt b/scratch/CMakeLists.txt
+index 06d7daf..7f42194 100644
+--- a/scratch/CMakeLists.txt
++++ b/scratch/CMakeLists.txt
+@@ -48,12 +48,12 @@ function(create_scratch source_files)
+   if(${NS3_STATIC})
+     target_link_libraries(
+       ${target_prefix}${scratch_name} ${LIB_AS_NEEDED_PRE_STATIC}
+-      ${lib-ns3-static}
++      ${lib-ns3-static} "z3"
+     )
+   else()
+     target_link_libraries(
+       ${target_prefix}${scratch_name} "${ns3-libs}" "${ns3-contrib-libs}"
+-      "${ns3-external-libs}"
++      "${ns3-external-libs}" "z3"
+     )
+   endif()
+   set_runtime_outputdirectory(
+diff --git a/src/applications/model/packet-sink.cc b/src/applications/model/packet-sink.cc
+index a902d9d..28d45dc 100644
+--- a/src/applications/model/packet-sink.cc
++++ b/src/applications/model/packet-sink.cc
+@@ -34,6 +34,7 @@
+ #include "ns3/boolean.h"
+ #include "ns3/ipv4-packet-info-tag.h"
+ #include "ns3/ipv6-packet-info-tag.h"
++#include "ns3/flow-id-tag.h"
+ 
+ namespace ns3 {
+ 
+@@ -58,11 +59,19 @@ PacketSink::GetTypeId (void)
+                    TypeIdValue (UdpSocketFactory::GetTypeId ()),
+                    MakeTypeIdAccessor (&PacketSink::m_tid),
+                    MakeTypeIdChecker ())
++    .AddAttribute ("Source",
++                   "Source physical address", UintegerValue (0),
++                   MakeUintegerAccessor (&PacketSink::m_source),
++                   MakeUintegerChecker<uint32_t> ())
+     .AddAttribute ("EnableSeqTsSizeHeader",
+                    "Enable optional header tracing of SeqTsSizeHeader",
+                    BooleanValue (false),
+                    MakeBooleanAccessor (&PacketSink::m_enableSeqTsSizeHeader),
+                    MakeBooleanChecker ())
++    .AddTraceSource ("Tx",
++                     "A new packet is sent",
++                     MakeTraceSourceAccessor (&PacketSink::m_txTrace),
++                     "ns3::Packet::TracedCallback")
+     .AddTraceSource ("Rx",
+                      "A packet has been received",
+                      MakeTraceSourceAccessor (&PacketSink::m_rxTrace),
+@@ -74,6 +83,14 @@ PacketSink::GetTypeId (void)
+                      "A packet with SeqTsSize header has been received",
+                      MakeTraceSourceAccessor (&PacketSink::m_rxTraceWithSeqTsSize),
+                      "ns3::PacketSink::SeqTsSizeCallback")
++    .AddTraceSource ("RxWithDelay",
++                     "A packet has been received with its delay",
++                     MakeTraceSourceAccessor (&PacketSink::m_rxTraceWithDelay),
++                     "ns3::Packet::DelayTracedCallback")
++    .AddTraceSource ("CongState",
++                     "The congestion state has changed",
++                     MakeTraceSourceAccessor (&PacketSink::m_disorderTrace),
++                     "ns3::TcpSocketState::TcpCongStatesTracedValueCallback")
+   ;
+   return tid;
+ }
+@@ -170,6 +187,40 @@ void PacketSink::StartApplication ()    // Called at time specified by Start
+   m_socket->SetCloseCallbacks (
+     MakeCallback (&PacketSink::HandlePeerClose, this),
+     MakeCallback (&PacketSink::HandlePeerError, this));
++  m_socket->TraceConnectWithoutContext ("Tx", MakeCallback (&PacketSink::TxEvent, this));
++  m_socket->TraceConnectWithoutContext ("CongState",
++                                        MakeCallback (&PacketSink::RecordCongState, this));
++
++  if (m_tid != UdpSocketFactory::GetTypeId ())
++    {
++      m_socket->TraceConnectWithoutContext ("Rx", MakeCallback (&PacketSink::RxEvent, this));
++      m_socket->SetAttribute ("Source", UintegerValue (m_source));
++    }
++}
++
++void
++PacketSink::RecordCongState (const TcpSocketState::TcpCongState_t oldState,
++                             const TcpSocketState::TcpCongState_t newState, const uint32_t &flowId)
++{
++  m_disorderTrace (oldState, newState, flowId);
++}
++
++void
++PacketSink::TxEvent (const Ptr<const Packet> packet, const TcpHeader &header,
++                     const Ptr<const TcpSocketBase> socket)
++{
++  m_txTrace (packet, 0);
++}
++
++void
++PacketSink::RxEvent (const Ptr<const Packet> packet, const Address &from, const TcpHeader &header,
++                     const Ptr<const TcpSocketBase> socket)
++{
++  m_delayEstimation.RecordRx (packet);
++  FlowIdTag flowIdTag;
++  packet->PeekPacketTag (flowIdTag);
++  m_rxTraceWithDelay (packet, from, Simulator::Now () - m_delayEstimation.GetLastDelay (),
++                      Simulator::Now (), flowIdTag.GetFlowId ());
+ }
+ 
+ void PacketSink::StopApplication ()     // Called at time specified by Stop
+@@ -221,6 +272,7 @@ void PacketSink::HandleRead (Ptr<Socket> socket)
+         }
+ 
+       if (!m_rxTrace.IsEmpty () || !m_rxTraceWithAddresses.IsEmpty () ||
++          !m_rxTraceWithDelay.IsEmpty () ||
+           (!m_rxTraceWithSeqTsSize.IsEmpty () && m_enableSeqTsSizeHeader))
+         {
+           Ipv4PacketInfoTag interfaceInfo;
+@@ -244,6 +296,16 @@ void PacketSink::HandleRead (Ptr<Socket> socket)
+             {
+               PacketReceived (packet, from, localAddress);
+             }
++
++          if (m_tid == UdpSocketFactory::GetTypeId ())
++            {
++              m_delayEstimation.RecordRx (packet);
++              FlowIdTag flowIdTag;
++              packet->RemovePacketTag (flowIdTag);
++              m_rxTraceWithDelay (packet, from,
++                                  Simulator::Now () - m_delayEstimation.GetLastDelay (),
++                                  Simulator::Now (), flowIdTag.GetFlowId ());
++            }
+         }
+     }
+ }
+diff --git a/src/applications/model/packet-sink.h b/src/applications/model/packet-sink.h
+index 44283e9..083e579 100644
+--- a/src/applications/model/packet-sink.h
++++ b/src/applications/model/packet-sink.h
+@@ -28,6 +28,9 @@
+ #include "ns3/address.h"
+ #include "ns3/inet-socket-address.h"
+ #include "ns3/seq-ts-size-header.h"
++#include "ns3/delay-jitter-estimation.h"
++#include "ns3/tcp-header.h"
++#include "ns3/tcp-socket-base.h"
+ #include <unordered_map>
+ 
+ namespace ns3 {
+@@ -180,8 +183,16 @@ private:
+   uint16_t        m_localPort;    //!< Local port to bind to
+   uint64_t        m_totalRx;      //!< Total bytes received
+   TypeId          m_tid;          //!< Protocol TypeId
++  uint32_t m_source;
+ 
+   bool            m_enableSeqTsSizeHeader {false}; //!< Enable or disable the export of SeqTsSize header 
++  DelayJitterEstimation m_delayEstimation;
++  void TxEvent (const Ptr<const Packet> packet, const TcpHeader &header,
++                const Ptr<const TcpSocketBase> socket);
++  void RxEvent (const Ptr<const Packet> packet, const Address &from, const TcpHeader &header,
++                const Ptr<const TcpSocketBase> socket);
++  void RecordCongState (const TcpSocketState::TcpCongState_t, const TcpSocketState::TcpCongState_t,
++                        const uint32_t &);
+ 
+   /// Traced Callback: received packets, source address.
+   TracedCallback<Ptr<const Packet>, const Address &> m_rxTrace;
+@@ -189,6 +200,12 @@ private:
+   TracedCallback<Ptr<const Packet>, const Address &, const Address &> m_rxTraceWithAddresses;
+   /// Callbacks for tracing the packet Rx events, includes source, destination addresses, and headers
+   TracedCallback<Ptr<const Packet>, const Address &, const Address &, const SeqTsSizeHeader&> m_rxTraceWithSeqTsSize;
++  /// Callbacks for tracing the packet Rx events, includes source address, and delay
++  TracedCallback<Ptr<const Packet>, const Address &, const Time &, const Time &, const uint32_t &>
++      m_rxTraceWithDelay;
++  TracedCallback<Ptr<const Packet>, const uint32_t &> m_txTrace;
++  TracedCallback<TcpSocketState::TcpCongState_t, TcpSocketState::TcpCongState_t, const uint32_t &>
++      m_disorderTrace;
+ };
+ 
+ } // namespace ns3
+diff --git a/src/internet/CMakeLists.txt b/src/internet/CMakeLists.txt
+index 4234977..f2b50e1 100644
+--- a/src/internet/CMakeLists.txt
++++ b/src/internet/CMakeLists.txt
+@@ -22,10 +22,12 @@ set(source_files
+     model/global-route-manager-impl.cc
+     model/global-route-manager.cc
+     model/global-router-interface.cc
++    model/hops-tag.cc
+     model/icmpv4-l4-protocol.cc
+     model/icmpv4.cc
+     model/icmpv6-header.cc
+     model/icmpv6-l4-protocol.cc
++    model/ip-interceptor.cc
+     model/ip-l4-protocol.cc
+     model/ipv4-address-generator.cc
+     model/ipv4-end-point-demux.cc
+@@ -84,6 +86,7 @@ set(source_files
+     model/ripng-header.cc
+     model/ripng.cc
+     model/rtt-estimator.cc
++    model/source-tag.cc
+     model/tcp-bbr.cc
+     model/tcp-bic.cc
+     model/tcp-congestion-ops.cc
+@@ -153,10 +156,12 @@ set(header_files
+     model/global-route-manager-impl.h
+     model/global-route-manager.h
+     model/global-router-interface.h
++    model/hops-tag.h
+     model/icmpv4-l4-protocol.h
+     model/icmpv4.h
+     model/icmpv6-header.h
+     model/icmpv6-l4-protocol.h
++    model/ip-interceptor.h
+     model/ip-l4-protocol.h
+     model/ipv4-address-generator.h
+     model/ipv4-end-point-demux.h
+@@ -209,6 +214,7 @@ set(header_files
+     model/ripng-header.h
+     model/ripng.h
+     model/rtt-estimator.h
++    model/source-tag.h
+     model/tcp-bbr.h
+     model/tcp-bic.h
+     model/tcp-congestion-ops.h
+diff --git a/src/internet/model/hops-tag.cc b/src/internet/model/hops-tag.cc
+new file mode 100644
+index 0000000..60a9d6e
+--- /dev/null
++++ b/src/internet/model/hops-tag.cc
+@@ -0,0 +1,58 @@
++#include "hops-tag.h"
++
++namespace ns3 {
++
++HopsTag::HopsTag () : m_hopCount (0)
++{
++}
++
++TypeId
++HopsTag::GetTypeId (void)
++{
++  static TypeId tid =
++      TypeId ("HopsTag").SetParent<Tag> ().SetGroupName ("Sim").AddConstructor<HopsTag> ();
++  return tid;
++}
++
++TypeId
++HopsTag::GetInstanceTypeId (void) const
++{
++  return GetTypeId ();
++}
++
++uint32_t
++HopsTag::GetSerializedSize (void) const
++{
++  return 4;
++}
++
++void
++HopsTag::Serialize (TagBuffer i) const
++{
++  i.WriteU32 (m_hopCount);
++}
++
++void
++HopsTag::Deserialize (TagBuffer i)
++{
++  m_hopCount = i.ReadU32 ();
++}
++
++void
++HopsTag::Print (std::ostream &os) const
++{
++  os << "Hops tag=" << m_hopCount;
++}
++
++uint32_t
++HopsTag::GetHops (void) const
++{
++  return m_hopCount;
++}
++
++void
++HopsTag::IncHops ()
++{
++  m_hopCount++;
++}
++} // namespace ns3
+diff --git a/src/internet/model/hops-tag.h b/src/internet/model/hops-tag.h
+new file mode 100644
+index 0000000..85314f3
+--- /dev/null
++++ b/src/internet/model/hops-tag.h
+@@ -0,0 +1,33 @@
++#ifndef HOPS_TAG_H
++#define HOPS_TAG_H
++
++#include "ns3/tag.h"
++
++namespace ns3 {
++class HopsTag : public Tag
++{
++public:
++  HopsTag ();
++
++  /**
++     * \brief Get the type ID.
++     * \return the object TypeId
++     */
++  static TypeId GetTypeId (void);
++  virtual TypeId GetInstanceTypeId (void) const;
++
++  virtual uint32_t GetSerializedSize (void) const;
++  virtual void Serialize (TagBuffer i) const;
++  virtual void Deserialize (TagBuffer i);
++  virtual void Print (std::ostream &os) const;
++
++  void IncHops ();
++  uint32_t GetHops (void) const;
++
++private:
++  uint32_t m_hopCount;
++};
++
++} // namespace ns3
++
++#endif /* HOPS_TAG_H */
+\ No newline at end of file
+diff --git a/src/internet/model/ip-interceptor.cc b/src/internet/model/ip-interceptor.cc
+new file mode 100644
+index 0000000..94836c4
+--- /dev/null
++++ b/src/internet/model/ip-interceptor.cc
+@@ -0,0 +1,202 @@
++// -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*-
++//
++// Copyright (c) 2006 Georgia Tech Research Corporation
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License version 2 as
++// published by the Free Software Foundation;
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License
++// along with this program; if not, write to the Free Software
++// Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++//
++// Author: George F. Riley<riley@ece.gatech.edu>
++//
++
++#include "ip-interceptor.h"
++
++namespace ns3 {
++
++IpInterceptor::IpInterceptor ()
++{
++}
++
++IpInterceptor::~IpInterceptor ()
++{
++}
++
++void
++IpInterceptor::AddPacketInterceptor (PacketInterceptorCallback picb, uint8_t protocol)
++{
++  Ptr<InterceptorItem> newitem = CreateObject<InterceptorItem> (picb, protocol);
++
++  if (m_interceptors.empty ())
++    {
++      m_interceptors.push_front (newitem);
++    }
++  else
++    {
++      std::list<Ptr<InterceptorItem>>::iterator it = m_interceptors.begin ();
++      for (uint32_t i = 0; i < m_interceptors.size (); i++)
++        {
++          if (*(*it) == *newitem)
++            {
++              *(*it) = *newitem;
++              break;
++            }
++          else
++            it++;
++        }
++    }
++}
++
++bool
++IpInterceptor::RemovePacketInterceptor (uint8_t protocol)
++{
++  bool res = false;
++  InterceptorItem auxitem (MakeNullCallback<bool, Ptr<Packet>, Ipv4Header &> (), protocol);
++
++  //This is still incomplete. Must remove the item.
++
++  if (!m_interceptors.empty ())
++    {
++      std::list<Ptr<InterceptorItem>>::iterator it = m_interceptors.begin ();
++      for (uint32_t i = 0; i < m_interceptors.size (); i++)
++        {
++          if (*(*it) == auxitem)
++            {
++              res = true;
++              break;
++            }
++          else
++            it++;
++        }
++    }
++
++  return res;
++}
++
++bool
++IpInterceptor::HasPacketInterceptor (PacketInterceptorCallback &picb, uint8_t protocol)
++{
++  bool res = false;
++  InterceptorItem auxitem (MakeNullCallback<bool, Ptr<Packet>, Ipv4Header &> (), protocol);
++
++  if (!m_interceptors.empty ())
++    {
++      std::list<Ptr<InterceptorItem>>::iterator it = m_interceptors.begin ();
++      for (uint32_t i = 0; i < m_interceptors.size (); i++)
++        {
++          if (*(*it) == auxitem)
++            {
++              res = true;
++              break;
++            }
++          else
++            it++;
++        }
++    }
++
++  return res;
++}
++
++bool
++IpInterceptor::GetPacketInterceptor (PacketInterceptorCallback &picb, uint8_t protocol)
++{
++  bool res = false;
++  InterceptorItem auxitem (MakeNullCallback<bool, Ptr<Packet>, Ipv4Header &> (),
++                           protocol);
++
++  if (!m_interceptors.empty ())
++    {
++      std::list<Ptr<InterceptorItem>>::iterator it = m_interceptors.begin ();
++      for (uint32_t i = 0; i < m_interceptors.size (); i++)
++        {
++          if (*(*it) == auxitem)
++            {
++              picb = (*(*it)).Get ();
++              res = true;
++              break;
++            }
++          else
++            it++;
++        }
++    }
++
++  return res;
++}
++
++bool
++IpInterceptor::CallPacketInterceptor (uint8_t protocol, Ptr<Packet> packet, Ipv4Header &ipHeader)
++{
++  PacketInterceptorCallback picb;
++  bool forward = true;
++
++  if (GetPacketInterceptor (picb, protocol))
++    {
++      forward = picb (packet, ipHeader);
++    }
++
++  return forward;
++}
++
++IpInterceptor::InterceptorItem::InterceptorItem (const PacketInterceptorCallback picb,
++                                                 const uint16_t protocol)
++{
++  m_picb = picb;
++  m_protocol = protocol;
++}
++
++void
++IpInterceptor::InterceptorItem::Set (const PacketInterceptorCallback picb, const uint16_t protocol)
++{
++  m_picb = picb;
++  m_protocol = protocol;
++}
++
++void
++IpInterceptor::InterceptorItem::Get (PacketInterceptorCallback &picb, uint16_t &protocol) const
++{
++  picb = m_picb;
++  protocol = m_protocol;
++}
++
++IpInterceptor::PacketInterceptorCallback
++IpInterceptor::InterceptorItem::Get () const
++{
++  return m_picb;
++}
++
++IpInterceptor::InterceptorItem &
++IpInterceptor::InterceptorItem::operator= (const InterceptorItem &oii)
++{
++  oii.Get (m_picb, m_protocol);
++  return *this;
++}
++
++bool
++IpInterceptor::InterceptorItem::operator== (const InterceptorItem &oii) const
++{
++  PacketInterceptorCallback picb;
++  uint16_t protocol;
++
++  oii.Get (picb, protocol);
++  return m_protocol == protocol;
++}
++
++bool
++IpInterceptor::InterceptorItem::operator!= (const InterceptorItem &oii) const
++{
++  PacketInterceptorCallback picb;
++  uint16_t protocol;
++
++  oii.Get (picb, protocol);
++  return m_protocol != protocol;
++}
++
++} // namespace ns3
+\ No newline at end of file
+diff --git a/src/internet/model/ip-interceptor.h b/src/internet/model/ip-interceptor.h
+new file mode 100644
+index 0000000..484351e
+--- /dev/null
++++ b/src/internet/model/ip-interceptor.h
+@@ -0,0 +1,82 @@
++// -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*-
++//
++// Copyright (c) 2006 Georgia Tech Research Corporation
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License version 2 as
++// published by the Free Software Foundation;
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License
++// along with this program; if not, write to the Free Software
++// Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++//
++// Author: George F. Riley<riley@ece.gatech.edu>
++// Source: https://groups.google.com/g/ns-3-users/c/Ba5qRDUivVQ/m/_0y42Z0ql78J
++//
++#ifndef IP_INTERCEPTOR_H
++#define IP_INTERCEPTOR_H
++
++#include <list>
++#include "ns3/ipv4-address.h"
++#include "ns3/address.h"
++#include "ns3/ptr.h"
++#include "ns3/packet.h"
++#include "ns3/ipv4-header.h"
++#include "ns3/traced-callback.h"
++#include "ns3/object.h"
++
++namespace ns3 {
++
++/**
++ * \ingroup internet
++ * \brief IP packet interceptor, allowing high layers to intercept IP packets at intermediate nodes.
++ */
++
++class IpInterceptor
++{
++public:
++  static TypeId GetTypeId (void);
++
++  IpInterceptor ();
++  virtual ~IpInterceptor ();
++
++  typedef Callback<bool, Ptr<Packet>, Ipv4Header &> PacketInterceptorCallback;
++  void AddPacketInterceptor (PacketInterceptorCallback picb, uint8_t protocol);
++  bool RemovePacketInterceptor (uint8_t protocol);
++
++  bool HasPacketInterceptor (PacketInterceptorCallback &picb, uint8_t protocol);
++  bool GetPacketInterceptor (PacketInterceptorCallback &picb, uint8_t protocol);
++  bool CallPacketInterceptor (uint8_t protocol, Ptr<Packet> packet, Ipv4Header &ipHeader);
++
++protected:
++  class InterceptorItem : public Object
++  {
++  public:
++    InterceptorItem (const PacketInterceptorCallback picb, const uint16_t protocol);
++
++    void Set (const PacketInterceptorCallback picb, const uint16_t protocol);
++
++    void Get (PacketInterceptorCallback &picb, uint16_t &protocol) const;
++
++    PacketInterceptorCallback Get () const;
++
++    InterceptorItem &operator= (const InterceptorItem &rhs);
++    bool operator== (const InterceptorItem &other) const;
++    bool operator!= (const InterceptorItem &other) const;
++
++  private:
++    PacketInterceptorCallback m_picb;
++    uint16_t m_protocol;
++  };
++
++  std::list<Ptr<InterceptorItem>> m_interceptors;
++};
++
++} // namespace ns3
++
++#endif /* IP_INTERCEPTOR_H */
+\ No newline at end of file
+diff --git a/src/internet/model/ipv4-global-routing.cc b/src/internet/model/ipv4-global-routing.cc
+index 67db6e1..ebeb7dc 100644
+--- a/src/internet/model/ipv4-global-routing.cc
++++ b/src/internet/model/ipv4-global-routing.cc
+@@ -28,6 +28,9 @@
+ #include "ns3/ipv4-routing-table-entry.h"
+ #include "ns3/boolean.h"
+ #include "ns3/node.h"
++#include "ns3/enum.h"
++#include "ns3/udp-header.h"
++#include "ns3/tcp-header.h"
+ #include "ipv4-global-routing.h"
+ #include "global-route-manager.h"
+ 
+@@ -37,17 +40,21 @@ NS_LOG_COMPONENT_DEFINE ("Ipv4GlobalRouting");
+ 
+ NS_OBJECT_ENSURE_REGISTERED (Ipv4GlobalRouting);
+ 
++/* see http://www.iana.org/assignments/protocol-numbers */
++const uint8_t TCP_PROT_NUMBER = 6; //!< TCP Protocol number
++const uint8_t UDP_PROT_NUMBER = 17; //!< UDP Protocol number
++
+ TypeId 
+ Ipv4GlobalRouting::GetTypeId (void)
+ { 
+   static TypeId tid = TypeId ("ns3::Ipv4GlobalRouting")
+     .SetParent<Object> ()
+     .SetGroupName ("Internet")
+-    .AddAttribute ("RandomEcmpRouting",
+-                   "Set to true if packets are randomly routed among ECMP; set to false for using only one route consistently",
+-                   BooleanValue (false),
+-                   MakeBooleanAccessor (&Ipv4GlobalRouting::m_randomEcmpRouting),
+-                   MakeBooleanChecker ())
++    .AddAttribute ("EcmpMode",
++                   "Used to choose one of the serveral implemented multi-path modes",
++                   EnumValue (ECMP_NONE),
++                   MakeEnumAccessor (&Ipv4GlobalRouting::m_ecmpMode),
++                   MakeEnumChecker (ECMP_NONE, "ECMP_NONE", ECMP_RANDOM, "ECMP_RANDOM", ECMP_PER_FLOW, "ECMP_PER_FLOW"))
+     .AddAttribute ("RespondToInterfaceEvents",
+                    "Set to true if you want to dynamically recompute the global routes upon Interface notification events (up/down, or add/remove address)",
+                    BooleanValue (false),
+@@ -58,12 +65,14 @@ Ipv4GlobalRouting::GetTypeId (void)
+ }
+ 
+ Ipv4GlobalRouting::Ipv4GlobalRouting () 
+-  : m_randomEcmpRouting (false),
++  : m_ecmpMode (ECMP_NONE),
+     m_respondToInterfaceEvents (false)
+ {
+   NS_LOG_FUNCTION (this);
+ 
+   m_rand = CreateObject<UniformRandomVariable> ();
++  m_hasher = Hasher ();
++  m_seed = m_rand->GetInteger (0, (uint32_t) -1);
+ }
+ 
+ Ipv4GlobalRouting::~Ipv4GlobalRouting ()
+@@ -135,10 +144,37 @@ Ipv4GlobalRouting::AddASExternalRouteTo (Ipv4Address network,
+   m_ASexternalRoutes.push_back (route);
+ }
+ 
++uint64_t
++Ipv4GlobalRouting::GetFlowHash (const Ipv4Header &header, Ptr<const Packet> ipPayload)
++{
++  NS_LOG_FUNCTION (header);
++  Ptr<Node> node = m_ipv4->GetObject<Node> ();
++
++  m_hasher.clear ();
++  std::ostringstream oss;
++  oss << header.GetSource () << header.GetDestination () << header.GetProtocol ();
++
++  if (header.GetProtocol () == UDP_PROT_NUMBER)
++    {
++      UdpHeader udpHeader;
++      ipPayload->PeekHeader (udpHeader);
++      oss << udpHeader.GetSourcePort () << udpHeader.GetDestinationPort ();
++    }
++  else if (header.GetProtocol () == TCP_PROT_NUMBER)
++    {
++      TcpHeader tcpHeader;
++      ipPayload->PeekHeader (tcpHeader);
++      oss << tcpHeader.GetSourcePort () << tcpHeader.GetDestinationPort ();
++    }
++
++  std::string data = oss.str ();
++  return m_hasher.GetHash64 (data);
++}
+ 
+ Ptr<Ipv4Route>
+-Ipv4GlobalRouting::LookupGlobal (Ipv4Address dest, Ptr<NetDevice> oif)
++Ipv4GlobalRouting::LookupGlobal (const Ipv4Header &header, Ptr<const Packet> ipPayload, Ptr<NetDevice> oif)
+ {
++  Ipv4Address dest = header.GetDestination ();
+   NS_LOG_FUNCTION (this << dest << oif);
+   NS_LOG_LOGIC ("Looking for route for destination " << dest);
+   Ptr<Ipv4Route> rtentry = 0;
+@@ -220,11 +256,15 @@ Ipv4GlobalRouting::LookupGlobal (Ipv4Address dest, Ptr<NetDevice> oif)
+       // ECMP routing is enabled, or always select the first route
+       // consistently if random ECMP routing is disabled
+       uint32_t selectIndex;
+-      if (m_randomEcmpRouting)
++      if (m_ecmpMode == ECMP_RANDOM)
+         {
+           selectIndex = m_rand->GetInteger (0, allRoutes.size ()-1);
+         }
+-      else 
++      else if (m_ecmpMode == ECMP_PER_FLOW)
++        {
++          selectIndex = GetFlowHash (header, ipPayload) % allRoutes.size ();
++        }
++      else // ECMP_NONE
+         {
+           selectIndex = 0;
+         }
+@@ -475,7 +515,7 @@ Ipv4GlobalRouting::RouteOutput (Ptr<Packet> p, const Ipv4Header &header, Ptr<Net
+ // See if this is a unicast packet we have a route for.
+ //
+   NS_LOG_LOGIC ("Unicast destination- looking up");
+-  Ptr<Ipv4Route> rtentry = LookupGlobal (header.GetDestination (), oif);
++  Ptr<Ipv4Route> rtentry = LookupGlobal (header, p, oif);
+   if (rtentry)
+     {
+       sockerr = Socket::ERROR_NOTERROR;
+@@ -524,7 +564,7 @@ Ipv4GlobalRouting::RouteInput  (Ptr<const Packet> p, const Ipv4Header &header, P
+     }
+   // Next, try to find a route
+   NS_LOG_LOGIC ("Unicast destination- looking up global route");
+-  Ptr<Ipv4Route> rtentry = LookupGlobal (header.GetDestination ());
++  Ptr<Ipv4Route> rtentry = LookupGlobal (header, p);
+   if (rtentry != 0)
+     {
+       NS_LOG_LOGIC ("Found unicast destination- calling unicast callback");
+diff --git a/src/internet/model/ipv4-global-routing.h b/src/internet/model/ipv4-global-routing.h
+index d58c1b6..a12eca7 100644
+--- a/src/internet/model/ipv4-global-routing.h
++++ b/src/internet/model/ipv4-global-routing.h
+@@ -71,6 +71,12 @@ class Node;
+ class Ipv4GlobalRouting : public Ipv4RoutingProtocol
+ {
+ public:
++  enum EcmpMode {
++    ECMP_NONE,
++    ECMP_RANDOM,
++    ECMP_PER_FLOW
++  };
++
+   /**
+    * \brief Get the type ID.
+    * \return the object TypeId
+@@ -228,16 +234,19 @@ public:
+    */
+   int64_t AssignStreams (int64_t stream);
+ 
++  uint64_t GetFlowHash(const Ipv4Header &header, Ptr<const Packet> ipPayload);
+ protected:
+   void DoDispose (void);
+ 
+ private:
+-  /// Set to true if packets are randomly routed among ECMP; set to false for using only one route consistently
+-  bool m_randomEcmpRouting;
++  /// Set to desired ecmp mode
++  enum EcmpMode m_ecmpMode;
+   /// Set to true if this interface should respond to interface events by globallly recomputing routes 
+   bool m_respondToInterfaceEvents;
+   /// A uniform random number generator for randomly routing packets among ECMP 
+   Ptr<UniformRandomVariable> m_rand;
++  Hasher m_hasher;
++  uint32_t m_seed;
+ 
+   /// container of Ipv4RoutingTableEntry (routes to hosts)
+   typedef std::list<Ipv4RoutingTableEntry *> HostRoutes;
+@@ -266,7 +275,7 @@ private:
+    * \param oif output interface if any (put 0 otherwise)
+    * \return Ipv4Route to route the packet to reach dest address
+    */
+-  Ptr<Ipv4Route> LookupGlobal (Ipv4Address dest, Ptr<NetDevice> oif = 0);
++  Ptr<Ipv4Route> LookupGlobal (const Ipv4Header &header, Ptr<const Packet> ipPayload, Ptr<NetDevice> oif = 0);
+ 
+   HostRoutes m_hostRoutes;             //!< Routes to hosts
+   NetworkRoutes m_networkRoutes;       //!< Routes to networks
+diff --git a/src/internet/model/ipv4-l3-protocol.cc b/src/internet/model/ipv4-l3-protocol.cc
+index e83e0aa..3d1abf3 100644
+--- a/src/internet/model/ipv4-l3-protocol.cc
++++ b/src/internet/model/ipv4-l3-protocol.cc
+@@ -646,11 +646,28 @@ Ipv4L3Protocol::Receive ( Ptr<NetDevice> device, Ptr<const Packet> p, uint16_t p
+         }
+     }
+ 
++  bool forwardedToRawSocket = false;
+   for (SocketList::iterator i = m_sockets.begin (); i != m_sockets.end (); ++i)
+     {
+       NS_LOG_LOGIC ("Forwarding to raw socket"); 
+       Ptr<Ipv4RawSocketImpl> socket = *i;
+       socket->ForwardUp (packet, ipHeader, ipv4Interface);
++      forwardedToRawSocket = true;
++    }
++
++  // Exit if forwarded to raw socket. Otherwise an ICMP unreachable packet will be sent.
++  if (forwardedToRawSocket)
++    {
++      return;
++    }
++
++  NS_LOG_LOGIC ("Interceptor call");
++  bool forward;
++  forward = CallPacketInterceptor (ipHeader.GetProtocol (), packet, ipHeader);
++  if (!forward)
++    {
++      NS_LOG_LOGIC ("Packet not forwarded.");
++      return;
+     }
+ 
+   if (m_enableDpd && ipHeader.GetDestination ().IsMulticast () && UpdateDuplicate (packet, ipHeader))
+@@ -660,8 +677,14 @@ Ipv4L3Protocol::Receive ( Ptr<NetDevice> device, Ptr<const Packet> p, uint16_t p
+       return;
+     }
+ 
++  ReceiveInternal (packet, ipHeader, device);
++}
++
++void
++Ipv4L3Protocol::ReceiveInternal (Ptr<const Packet> p, Ipv4Header &ipHeader, Ptr<NetDevice> device)
++{
+   NS_ASSERT_MSG (m_routingProtocol != 0, "Need a routing protocol object to process packets");
+-  if (!m_routingProtocol->RouteInput (packet, ipHeader, device,
++  if (!m_routingProtocol->RouteInput (p, ipHeader, device,
+                                       MakeCallback (&Ipv4L3Protocol::IpForward, this),
+                                       MakeCallback (&Ipv4L3Protocol::IpMulticastForward, this),
+                                       MakeCallback (&Ipv4L3Protocol::LocalDeliver, this),
+@@ -669,7 +692,7 @@ Ipv4L3Protocol::Receive ( Ptr<NetDevice> device, Ptr<const Packet> p, uint16_t p
+                                       ))
+     {
+       NS_LOG_WARN ("No route found for forwarding packet.  Drop.");
+-      m_dropTrace (ipHeader, packet, DROP_NO_ROUTE, this, interface);
++      m_dropTrace (ipHeader, p, DROP_NO_ROUTE, this, GetInterfaceForDevice (device));
+     }
+ }
+ 
+diff --git a/src/internet/model/ipv4-l3-protocol.h b/src/internet/model/ipv4-l3-protocol.h
+index 69c293e..f0e51bd 100644
+--- a/src/internet/model/ipv4-l3-protocol.h
++++ b/src/internet/model/ipv4-l3-protocol.h
+@@ -34,6 +34,7 @@
+ #include "ns3/ipv4-routing-protocol.h"
+ #include "ns3/nstime.h"
+ #include "ns3/simulator.h"
++#include "ns3/ip-interceptor.h"
+ 
+ class Ipv4L3ProtocolTestCase;
+ 
+@@ -77,7 +78,7 @@ class Icmpv4L4Protocol;
+  * kernel. Hence it is not possible, for instance, to test a fragmentation
+  * attack.
+  */
+-class Ipv4L3Protocol : public Ipv4
++class Ipv4L3Protocol : public Ipv4, public IpInterceptor
+ {
+ public:
+   /**
+@@ -157,7 +158,7 @@ public:
+    */
+   void Receive ( Ptr<NetDevice> device, Ptr<const Packet> p, uint16_t protocol, const Address &from,
+                  const Address &to, NetDevice::PacketType packetType);
+-
++  void ReceiveInternal (Ptr<const Packet> p, Ipv4Header &ipHeader, Ptr<NetDevice> device);
+   /**
+    * \param packet packet to send
+    * \param source source address of packet
+diff --git a/src/internet/model/source-tag.cc b/src/internet/model/source-tag.cc
+new file mode 100644
+index 0000000..dddd0d6
+--- /dev/null
++++ b/src/internet/model/source-tag.cc
+@@ -0,0 +1,59 @@
++#include "source-tag.h"
++
++namespace ns3
++{
++
++SourceTag::SourceTag()
++{
++}
++
++TypeId
++SourceTag::GetTypeId(void)
++{
++    static TypeId tid =
++        TypeId("SourceTag").SetParent<Tag>().SetGroupName("Sim").AddConstructor<SourceTag>();
++    return tid;
++}
++
++TypeId
++SourceTag::GetInstanceTypeId(void) const
++{
++    return GetTypeId();
++}
++
++uint32_t
++SourceTag::GetSerializedSize(void) const
++{
++    return 4;
++}
++
++void
++SourceTag::Serialize(TagBuffer i) const
++{
++    i.WriteU32(m_physicalSource.Get());
++}
++
++void
++SourceTag::Deserialize(TagBuffer i)
++{
++    m_physicalSource = Ipv4Address(i.ReadU32());
++}
++
++void
++SourceTag::Print(std::ostream& os) const
++{
++    os << "Source address=" << m_physicalSource;
++}
++
++Ipv4Address
++SourceTag::GetSource(void) const
++{
++    return m_physicalSource;
++}
++
++void
++SourceTag::SetSource(Ipv4Address source)
++{
++    m_physicalSource = source;
++}
++} // namespace ns3
+diff --git a/src/internet/model/source-tag.h b/src/internet/model/source-tag.h
+new file mode 100644
+index 0000000..c9deef4
+--- /dev/null
++++ b/src/internet/model/source-tag.h
+@@ -0,0 +1,35 @@
++#ifndef SOURCE_TAG_H
++#define SOURCE_TAG_H
++
++#include "ns3/ipv4-address.h"
++#include "ns3/tag.h"
++
++namespace ns3
++{
++class SourceTag : public Tag
++{
++  public:
++    SourceTag();
++
++    /**
++     * \brief Get the type ID.
++     * \return the object TypeId
++     */
++    static TypeId GetTypeId(void);
++    virtual TypeId GetInstanceTypeId(void) const;
++
++    virtual uint32_t GetSerializedSize(void) const;
++    virtual void Serialize(TagBuffer i) const;
++    virtual void Deserialize(TagBuffer i);
++    virtual void Print(std::ostream& os) const;
++
++    void SetSource(Ipv4Address source);
++    Ipv4Address GetSource(void) const;
++
++  private:
++    Ipv4Address m_physicalSource;
++};
++
++} // namespace ns3
++
++#endif /* SOURCE_TAG_H */
+\ No newline at end of file
+diff --git a/src/internet/model/tcp-socket-base.cc b/src/internet/model/tcp-socket-base.cc
+index 9edcb16..b45c50f 100644
+--- a/src/internet/model/tcp-socket-base.cc
++++ b/src/internet/model/tcp-socket-base.cc
+@@ -59,6 +59,10 @@
+ #include "tcp-congestion-ops.h"
+ #include "tcp-recovery-ops.h"
+ #include "ns3/tcp-rate-ops.h"
++#include "ns3/flow-id-tag.h"
++#include "ns3/source-tag.h"
++#include "ns3/delay-jitter-estimation.h"
++#include "ns3/hops-tag.h"
+ 
+ #include <math.h>
+ #include <algorithm>
+@@ -143,6 +147,14 @@ TcpSocketBase::GetTypeId (void)
+                    MakeUintegerAccessor (&TcpSocketBase::SetRetxThresh,
+                                          &TcpSocketBase::GetRetxThresh),
+                    MakeUintegerChecker<uint32_t> ())
++    .AddAttribute ("Source", "Source tag value",
++                   UintegerValue (0),
++                   MakeUintegerAccessor (&TcpSocketBase::m_source),
++                   MakeUintegerChecker<uint32_t> ())
++    .AddAttribute ("FlowId", "FlowId tag value",
++                   UintegerValue (0),
++                   MakeUintegerAccessor (&TcpSocketBase::m_flowId),
++                   MakeUintegerChecker<uint32_t> ())
+     .AddAttribute ("LimitedTransmit", "Enable limited transmit",
+                    BooleanValue (true),
+                    MakeBooleanAccessor (&TcpSocketBase::m_limitedTx),
+@@ -317,6 +329,8 @@ TcpSocketBase::TcpSocketBase (const TcpSocketBase& sock)
+     m_synRetries (sock.m_synRetries),
+     m_dataRetrCount (sock.m_dataRetrCount),
+     m_dataRetries (sock.m_dataRetries),
++    m_source (sock.m_source),
++    m_flowId (sock.m_flowId),
+     m_rto (sock.m_rto),
+     m_minRto (sock.m_minRto),
+     m_clockGranularity (sock.m_clockGranularity),
+@@ -1272,6 +1286,13 @@ TcpSocketBase::DoForwardUp (Ptr<Packet> packet, const Address &fromAddress,
+   SocketPriorityTag priorityTag;
+   packet->RemovePacketTag (priorityTag);
+ 
++  // Inherit the flowId
++  FlowIdTag flowIdTag;
++  if (packet->PeekPacketTag (flowIdTag))
++    {
++      m_flowId = flowIdTag.GetFlowId ();
++    }
++
+   // Peel off TCP header
+   TcpHeader tcpHeader;
+   packet->RemoveHeader (tcpHeader);
+@@ -1293,14 +1314,14 @@ TcpSocketBase::DoForwardUp (Ptr<Packet> packet, const Address &fromAddress,
+         }
+     }
+ 
+-  m_rxTrace (packet, tcpHeader, this);
++  m_rxTrace (packet, fromAddress, tcpHeader, this);
+ 
+   if (tcpHeader.GetFlags () & TcpHeader::SYN)
+     {
+       /* The window field in a segment where the SYN bit is set (i.e., a <SYN>
+-       * or <SYN,ACK>) MUST NOT be scaled (from RFC 7323 page 9). But should be
+-       * saved anyway..
+-       */
++         * or <SYN,ACK>) MUST NOT be scaled (from RFC 7323 page 9). But should be
++         * saved anyway..
++         */
+       m_rWnd = tcpHeader.GetWindowSize ();
+ 
+       if (tcpHeader.HasOption (TcpOption::WINSCALE) && m_winScalingEnabled)
+@@ -1685,6 +1706,7 @@ TcpSocketBase::DupAck (uint32_t currentDelivered)
+                      m_dupAckCount << " dup ACKs");
+ 
+       m_congestionControl->CongestionStateSet (m_tcb, TcpSocketState::CA_DISORDER);
++      m_congStateTrace (m_tcb->m_congState, TcpSocketState::CA_DISORDER, m_flowId);
+       m_tcb->m_congState = TcpSocketState::CA_DISORDER;
+ 
+       NS_LOG_DEBUG ("CA_OPEN -> CA_DISORDER");
+@@ -2623,7 +2645,7 @@ TcpSocketBase::DoPeerClose (void)
+     {
+       m_dataRetrCount = m_dataRetries; // prevent endless FINs
+       NS_LOG_LOGIC ("TcpSocketBase " << this << " scheduling LATO1");
+-      Time lastRto = m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4);
++      Time lastRto = Max (m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4), m_minRto);
+       m_lastAckEvent = Simulator::Schedule (lastRto, &TcpSocketBase::LastAckTimeout, this);
+     }
+ }
+@@ -2847,7 +2869,8 @@ TcpSocketBase::SetupEndpoint ()
+       return -1;
+     }
+   NS_LOG_LOGIC ("Route exists");
+-  m_endPoint->SetLocalAddress (route->GetSource ());
++  // This sets the source address to 0.0.0.0. Comment for now.
++  // m_endPoint->SetLocalAddress (route->GetSource ());
+   return 0;
+ }
+ 
+@@ -3028,6 +3051,13 @@ TcpSocketBase::AddSocketTags (const Ptr<Packet> &p) const
+       priorityTag.SetPriority (priority);
+       p->ReplacePacketTag (priorityTag);
+     }
++
++  DelayJitterEstimation::PrepareTx (p);
++  SourceTag sourceTag;
++  sourceTag.SetSource (Ipv4Address (m_source));
++  p->AddPacketTag (sourceTag);
++  p->AddPacketTag (FlowIdTag (m_flowId));
++  p->AddPacketTag (HopsTag ());
+ }
+ 
+ /* Extract at most maxSize bytes from the TxBuffer at sequence seq, add the
+@@ -3783,7 +3813,7 @@ TcpSocketBase::LastAckTimeout (void)
+       m_dataRetrCount--;
+       SendEmptyPacket (TcpHeader::FIN | TcpHeader::ACK);
+       NS_LOG_LOGIC ("TcpSocketBase " << this << " rescheduling LATO1");
+-      Time lastRto = m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4);
++      Time lastRto = Max (m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4), m_minRto);
+       m_lastAckEvent = Simulator::Schedule (lastRto, &TcpSocketBase::LastAckTimeout, this);
+     }
+ }
+@@ -4375,7 +4405,7 @@ void
+ TcpSocketBase::UpdateCongState (TcpSocketState::TcpCongState_t oldValue,
+                                 TcpSocketState::TcpCongState_t newValue)
+ {
+-  m_congStateTrace (oldValue, newValue);
++  m_congStateTrace (oldValue, newValue, m_flowId);
+ }
+ 
+  void
+diff --git a/src/internet/model/tcp-socket-base.h b/src/internet/model/tcp-socket-base.h
+index 5dd2c9d..ac282b1 100644
+--- a/src/internet/model/tcp-socket-base.h
++++ b/src/internet/model/tcp-socket-base.h
+@@ -340,7 +340,7 @@ public:
+   /**
+    * \brief Callback pointer for congestion state trace chaining
+    */
+-  TracedCallback<TcpSocketState::TcpCongState_t, TcpSocketState::TcpCongState_t> m_congStateTrace;
++  TracedCallback<TcpSocketState::TcpCongState_t, TcpSocketState::TcpCongState_t, const uint32_t &> m_congStateTrace;
+ 
+    /**
+    * \brief Callback pointer for ECN state trace chaining
+@@ -1262,6 +1262,8 @@ protected:
+   uint32_t          m_synRetries   {0}; //!< Number of connection attempts
+   uint32_t          m_dataRetrCount {0}; //!< Count of remaining data retransmission attempts
+   uint32_t          m_dataRetries  {0}; //!< Number of data retransmission attempts
++  uint32_t          m_source       {0};
++  uint32_t          m_flowId       {0};
+ 
+   // Timeouts
+   TracedValue<Time> m_rto     {Seconds (0.0)}; //!< Retransmit timeout
+@@ -1337,7 +1339,7 @@ protected:
+   TracedCallback<Ptr<const Packet>, const TcpHeader&,
+                  Ptr<const TcpSocketBase> > m_txTrace; //!< Trace of transmitted packets
+ 
+-  TracedCallback<Ptr<const Packet>, const TcpHeader&,
++  TracedCallback<Ptr<const Packet>, const Address &, const TcpHeader&,
+                  Ptr<const TcpSocketBase> > m_rxTrace; //!< Trace of received packets
+ 
+   // Pacing related variable
+diff --git a/src/network/helper/delay-jitter-estimation.cc b/src/network/helper/delay-jitter-estimation.cc
+index 7c1959b..29fea08 100644
+--- a/src/network/helper/delay-jitter-estimation.cc
++++ b/src/network/helper/delay-jitter-estimation.cc
+@@ -30,32 +30,6 @@ namespace ns3 {
+  *
+  * The tag holds the packet's creation timestamp
+  */
+-class DelayJitterEstimationTimestampTag : public Tag
+-{
+-public:
+-  DelayJitterEstimationTimestampTag ();
+-
+-  /**
+-   * \brief Get the type ID.
+-   * \return the object TypeId
+-   */
+-  static TypeId GetTypeId (void);
+-  virtual TypeId GetInstanceTypeId (void) const;
+-
+-  virtual uint32_t GetSerializedSize (void) const;
+-  virtual void Serialize (TagBuffer i) const;
+-  virtual void Deserialize (TagBuffer i);
+-  virtual void Print (std::ostream &os) const;
+-
+-  /**
+-   * \brief Get the Transmission time stored in the tag
+-   * \return the transmission time
+-   */
+-  Time GetTxTime (void) const;
+-private:
+-  Time m_creationTime; //!< The time stored in the tag
+-};
+-
+ DelayJitterEstimationTimestampTag::DelayJitterEstimationTimestampTag ()
+   : m_creationTime (Simulator::Now ())
+ {
+@@ -117,14 +91,14 @@ void
+ DelayJitterEstimation::PrepareTx (Ptr<const Packet> packet)
+ {
+   DelayJitterEstimationTimestampTag tag;
+-  packet->AddByteTag (tag);
++  packet->AddPacketTag (tag);
+ }
+ void
+ DelayJitterEstimation::RecordRx (Ptr<const Packet> packet)
+ {
+   DelayJitterEstimationTimestampTag tag;
+   bool found;
+-  found = packet->FindFirstMatchingByteTag (tag);
++  found = packet->PeekPacketTag (tag);
+   if (!found)
+     {
+       return;
+diff --git a/src/network/helper/delay-jitter-estimation.h b/src/network/helper/delay-jitter-estimation.h
+index 6c903a0..64d5376 100644
+--- a/src/network/helper/delay-jitter-estimation.h
++++ b/src/network/helper/delay-jitter-estimation.h
+@@ -36,6 +36,33 @@ namespace ns3 {
+  * given in RFC 1889 Appendix A.8 ,p. 71, and repeated in
+  * RFC 3550 Appendix A.8, p. 94.
+  */
++class DelayJitterEstimationTimestampTag : public Tag
++{
++public:
++  DelayJitterEstimationTimestampTag ();
++
++  /**
++   * \brief Get the type ID.
++   * \return the object TypeId
++   */
++  static TypeId GetTypeId (void);
++  virtual TypeId GetInstanceTypeId (void) const;
++
++  virtual uint32_t GetSerializedSize (void) const;
++  virtual void Serialize (TagBuffer i) const;
++  virtual void Deserialize (TagBuffer i);
++  virtual void Print (std::ostream &os) const;
++
++  /**
++   * \brief Get the Transmission time stored in the tag
++   * \return the transmission time
++   */
++  Time GetTxTime (void) const;
++
++private:
++  Time m_creationTime; //!< The time stored in the tag
++};
++
+ class DelayJitterEstimation
+ {
+ public:
