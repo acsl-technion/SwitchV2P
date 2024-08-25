@@ -22,6 +22,7 @@ This repository includes the following components:
 * SwitchV2P simulation code for NS3
 * Required patches for NS3
 * Scripts for reproducing the paper's results
+* SwitchV2P P4 prototype
 
 ## Dependencies
 
